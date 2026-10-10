@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Literal, TypeVar
+from typing import Annotated, Literal, TypeVar
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -21,6 +21,7 @@ from agent.tools import image_block, text_block
 from terrain.compiler.compile import surface_y, water_top
 from terrain.features import feature_report, measure_features
 from terrain.materials import surface_metrics
+from terrain.ops import list_ops
 from terrain.state import WorldState
 
 Score = Literal[1, 2, 3, 4, 5]  # enum, not min/max: structured outputs reject numeric constraints
@@ -58,11 +59,21 @@ class _Strict(BaseModel):
 _T = TypeVar("_T", bound=_Strict)
 
 
+class Change(_Strict):
+    param: str = Field(description="Parameter name of the tool")
+    value: str = Field(description='New value as JSON, e.g. "0.3", "\\"u\\"" or "[[0.2, 0.5], [0.8, 0.5]]"')
+
+
 class Issue(_Strict):
     location: str = Field(description="Op id (e.g. 'raise_peak_1') or normalized 'u,v' position")
     severity: Literal["minor", "major", "blocking"]
     description: str
-    fix_hint: str = Field(description="Concrete change, ideally naming the tool and parameter")
+    tool: str = Field(description="The tool that makes the fix: an op name, update_op (change an existing op) or "
+                      "remove_op; 'none' if no tool can make it")
+    op_id: str = Field(description="For update_op and remove_op: the id of the one op to change or remove, exactly "
+                       "as in the op list (e.g. 'mountain_1'); empty for other tools. One fix per op.")
+    changes: list[Change] = Field(description="Parameter values to set with that tool; empty for remove_op or none")
+    fix_hint: str = Field(description="The fix in words; for tool 'none', the capability that is missing")
 
 
 class RubricScores(_Strict):
@@ -70,6 +81,7 @@ class RubricScores(_Strict):
     layout: Score
     naturalism: Score
     minecraft_quality: Score
+    materials: Score
     reference_match: Score | None = Field(description="null when there is no reference image")
 
 
@@ -113,7 +125,7 @@ class CritiqueResult(BaseModel):
             lines += [f"- [{c.severity}] {c.name}: {c.detail}" for c in failed]
         if self.issues:
             lines.append("Issues:")
-            lines += [f"- [{i.severity}] at {i.location}: {i.description} Fix: {i.fix_hint}" for i in self.issues]
+            lines += [f"- [{i.severity}] at {i.location}: {i.description} Fix: {i.fix_hint}{_fix_text(i)}" for i in self.issues]
         return "\n".join(lines)
 
 
@@ -167,6 +179,14 @@ def run_checks(session: Session) -> list[CheckResult]:
     return checks
 
 
+def _palette_text(state: WorldState) -> str:
+    from terrain.materials import DEFAULT_RULES
+
+    rules = state.palette_rules if state.palette_rules is not None else [r.model_dump(mode="json", exclude_none=True) for r in DEFAULT_RULES]
+    label = "custom" if state.palette_rules is not None else "default"
+    return f"{label}: " + json.dumps(rules, separators=(",", ":"))
+
+
 def _neighbours(a: np.ndarray) -> np.ndarray:
     p = np.pad(a, 1, mode="edge")
     return np.stack([p[:-2, 1:-1], p[2:, 1:-1], p[1:-1, :-2], p[1:-1, 2:]])
@@ -216,16 +236,128 @@ deliberate and balanced.
 spacing), 3 = plausible, 5 = convincing.
 - minecraft_quality: block-scale quality: no spikes, no floating water, walkable transitions where \
 expected. 1 = broken, 3 = minor artifacts, 5 = clean.
+- materials: the surface blocks, judged in the 3D render: do they suit each landform and the spec (rock \
+where it is steep or high, soil and grass where it is gentle, sand or gravel at water), and do they vary \
+naturally? 1 = wrong or one block everywhere, 3 = plausible with artifacts (rings or stripes of one block, \
+bare stone walls, abrupt switches at one slope), 5 = convincing. Fix materials with set_palette_rules or \
+paint_region.
 - reference_match: similarity to the reference images; null if there are none.
 
 3 means acceptable. Reserve 5 for results you would show as a showcase. Locate every issue with an op id \
-or a normalized 'u,v' position ((0,0) = north-west corner) and give a concrete fix. Say "pass" only if \
-there are no major or blocking issues and every score is at least 4."""
+or a normalized 'u,v' position ((0,0) = north-west corner) and give a concrete fix: the tool that makes it \
+and the parameter values to set, or tool "none" when no tool can make it. Say "pass" only if there are no \
+major or blocking issues and every score is at least 4."""
+
+
+CHARACTER_FIELDS = ("character", "roughness", "steepness")
+
+
+def _fix_text(issue: Issue) -> str:
+    """The structured fix as the builder sees it, e.g. " (update_op mountain_1: height=120, roughness=0.8)"."""
+    if issue.tool == "none":
+        return " (no tool can do this yet)"
+    target = f" {issue.op_id}" if issue.tool in ("update_op", "remove_op") else ""
+    changes = ", ".join(f"{c.param}={c.value}" for c in issue.changes)
+    return f" ({issue.tool}{target}{': ' + changes if changes else ''})"
+
+
+def tool_catalogue() -> str:
+    """One line per tool, generated from the registry (DESIGN §11.5): name, parameters with their allowed
+    values or range, and the first sentence of the description. Deterministic, so the prompt stays cacheable."""
+    lines = ["Tools the builder has. A fix names one of them and only its parameters; every parameter takes one "
+             "value per call (a width cannot vary along a path, for example).", ""]
+    for spec in list_ops():
+        schema = spec.params.model_json_schema()
+        own = [k for k in spec.params.model_fields if k not in CHARACTER_FIELDS]
+        shared = [k for k in spec.params.model_fields if k in CHARACTER_FIELDS]
+        params = ", ".join(_param_text(k, schema["properties"][k], schema) for k in own + shared)
+        lines.append(f"- {spec.name}({params}): {_first_sentence(spec.description)}")
+        if spec.name == "set_palette_rules":
+            lines.append(_palette_syntax())
+    lines += ["- update_op(id, params): change parameters of an existing op by id; the op keeps its other values.",
+              "- remove_op(id): remove an op and its effect.",
+              "character presets set roughness and steepness: gentle, rolling, rugged, jagged. A region is "
+              '{"circle": {"center", "radius"}}, {"polygon": [[u, v], ...]}, {"path": {"points", "width"}} or '
+              '{"feature": "<op id>"}.']
+    return "\n".join(lines)
+
+
+def _palette_syntax() -> str:
+    """The rule format, generated from the materials models, so palette fixes can be written as valid rules."""
+    from terrain.materials import Condition
+
+    conds = ", ".join(Condition.model_fields)
+    return ('  rules is the WHOLE new palette (it replaces the current one), first match wins: a list of '
+            '{"when": {<any of ' + conds + '>}, "use": {"kind": "single", "block": B} | {"kind": "mix", '
+            '"blocks": {B: weight, ...}, "patch_size"} | {"kind": "banded", "blocks": [B, ...], "band_min", '
+            '"band_max", "noise"}, "subsurface": B}; end with a rule without "when". Slopes in degrees, y in blocks.')
+
+
+def _param_text(name: str, prop: dict, schema: dict) -> str:
+    """name, plus allowed values (a|b) or a numeric range [lo..hi] where the schema has them."""
+    options = [o for o in prop.get("anyOf", [prop]) if o.get("type") != "null"]
+    o = options[0] if len(options) == 1 else {}
+    if "$ref" in o:
+        o = schema.get("$defs", {}).get(o["$ref"].split("/")[-1], {})
+    if "enum" in o and len(o["enum"]) <= 6:
+        return f"{name}={'|'.join(map(str, o['enum']))}"
+    lo = o.get("minimum", o.get("exclusiveMinimum"))
+    hi = o.get("maximum", o.get("exclusiveMaximum"))
+    return f"{name} [{lo:g}..{hi:g}]" if lo is not None and hi is not None else name
+
+
+def _first_sentence(text: str) -> str:
+    first = text.strip().split("\n\n")[0].replace("\n", " ")
+    end = first.find(". ")
+    return first if end < 0 else first[: end + 1]
+
+
+def hint_problems(issue: Issue, stack) -> list[str]:
+    """Why a structured fix could not be applied as written (empty = it names a real tool, real parameters
+    and values those parameters accept). `stack` resolves `op_id` for update_op and remove_op."""
+    from pydantic import TypeAdapter
+
+    from terrain.ops import get_op
+    from terrain.ops.registry import OpError
+
+    ids = {e.id: e.op for e in stack.entries}
+    if issue.tool == "none":
+        return []
+    if issue.tool == "remove_op":
+        return [] if issue.op_id in ids else [f"remove_op: no op with id {issue.op_id!r}"]
+    if issue.tool == "update_op":
+        if issue.op_id not in ids:
+            return [f"update_op: no op with id {issue.op_id!r}"]
+        op_name = ids[issue.op_id]
+    else:
+        op_name = issue.tool
+    try:
+        fields = get_op(op_name).params.model_fields
+    except OpError:
+        return [f"unknown tool {issue.tool!r}"]
+    problems = []
+    for c in issue.changes:
+        if c.param not in fields:
+            problems.append(f"{op_name} has no parameter {c.param!r}")
+            continue
+        try:
+            value = json.loads(c.value)
+        except json.JSONDecodeError:
+            value = c.value  # a bare word such as u or thermal
+        f = fields[c.param]
+        try:
+            TypeAdapter(Annotated[f.annotation, *f.metadata] if f.metadata else f.annotation).validate_python(value)
+        except ValidationError as e:
+            problems.append(f"{op_name}.{c.param}={c.value}: {e.errors(include_url=False)[0]['msg']}")
+    return problems
 
 
 class Critic:
-    def __init__(self, model: ModelAdapter) -> None:
+    def __init__(self, model: ModelAdapter, catalogue: bool = True) -> None:
+        """`catalogue`: append the generated tool catalogue to the system prompt (DESIGN §11.5); off only for
+        the A/B in scripts/catalogue_ab.py. The prompt is built once, so it stays byte-stable (caching)."""
         self.model = model
+        self.system = CRITIC_SYSTEM + ("\n\n" + tool_catalogue() if catalogue else "")
 
     def run_checks(self, session: Session) -> list[CheckResult]:
         return run_checks(session)
@@ -243,6 +375,7 @@ class Critic:
             f"# Terrain statistics\n{session.stats()}",
             f"# Features (measured by code)\n{feature_report(measure_features(session.stack))}",
             f"# Ops applied\n{session.summary()}",
+            "# Surface palette in use (set_palette_rules replaces all of it)\n" + _palette_text(session.state),
             "# Programmatic checks\n" + "\n".join(f"- {c.name}: {'pass' if c.passed else 'FAIL'} ({c.detail})" for c in checks),
         ]
         if references:
@@ -256,7 +389,7 @@ class Critic:
         content.append(text_block("\n\n".join(text)))
         content.extend(image_block(r) for r in renders or [])
 
-        out, response = self._structured(content, CRITIC_SYSTEM, CritiqueOutput)
+        out, response = self._structured(content, self.system, CritiqueOutput)
         failed_major = any(not c.passed and c.severity == "major" for c in checks)
         verdict = "revise" if failed_major else out.verdict
         return CritiqueResult(checks=checks, issues=out.issues, scores=out.scores, verdict=verdict), response
