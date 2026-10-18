@@ -1,4 +1,4 @@
-"""Peak-shaped terrain ops."""
+"""Peak- and ridge-shaped terrain ops."""
 
 from __future__ import annotations
 
@@ -8,8 +8,9 @@ import numpy as np
 from pydantic import Field
 from scipy.ndimage import map_coordinates
 
-from terrain.brushes import block_grid, blend, circle_distance, length_to_blocks, radial_weight, to_blocks
+from terrain.brushes import block_grid, blend, circle_distance, length_to_blocks, path_distance, radial_weight, smooth_path, to_blocks
 from terrain.noise import fractal_noise
+from terrain.ops.detail import detail_noise, detail_strength
 from terrain.ops.character import SCALES, CharacterParams
 from terrain.ops.registry import Norm, Point, register_op
 from terrain.state import WorldState
@@ -95,3 +96,48 @@ def _gullies(state: WorldState, p: RaisePeakParams, rel_dist: np.ndarray) -> np.
     noise = map_coordinates(np.tile(ring, 3), [pos], order=3, mode="wrap")
     t = np.clip(noise * 1.5, 0.0, 1.0)  # only the positive part cuts gullies; the rest stay ridges
     return t * t * (3.0 - 2.0 * t)
+
+
+# raise_ridge: a mountain range along a path (DESIGN §5.5), modelled on the range recipe that built the reference
+# range at (950, -400) in TerraformTest (EVIDENCE 2026-10-25): a narrow spine whose long flanks are a smooth
+# fade, broken into summits and cols by large-scale ridged noise weighted by height. One op does what took the
+# builder a hidden second step (a ridged, relief-weighted roughen limited to the spine).
+CREST = 0.06  # the flat-topped spine: 6% of the half width (recipe: 0.015 of a 0.235 half width)
+MASSIF = 1.1  # roughness -> summit/col noise amplitude as a share of the spine height (rugged 0.55 -> 0.6, as the recipe)
+MASSIF_SCALE = 0.64  # size of the summits/cols as a share of the base width (recipe: scale 0.3 for width 0.47)
+RUGGED_SHARPNESS = sharpness(0.6)  # the default character keeps the recipe's smoothstep flanks
+
+
+class RaiseRidgeParams(CharacterParams):
+    path: list[Point] = Field(min_length=2, max_length=32, description="Crest line as normalized (u, v) points.")
+    height: float = Field(gt=0.0, le=384.0, description="Blocks added at the highest summit.")
+    width: Norm = Field(gt=0.0, description="Base width across both flanks, as a fraction of the area's shorter side.")
+
+
+@register_op("raise_ridge", params=RaiseRidgeParams, stage="terrain")
+def raise_ridge(state: WorldState, p: RaiseRidgeParams) -> WorldState:
+    """Raise a mountain range or long ridge along a path: a spine with long fading flanks, broken into
+    summits, cols and spurs. Also for ridgelines and long valley walls.
+
+    width is the whole footprint, flanks included (ranges: 0.3-0.5). steepness shapes the flanks (low = broad
+    foothills, high = steep walls); roughness sets how deep the cols between summits are (0 = an even crest).
+    The highest summit adds `height`. Finish a range with erode (hydraulic) for gullies and foothills, then a
+    small ridged roughen for crags, then the palette. Valley walls and grassy flanks are usually 30-45°: if
+    the result's mean slope is steeper, widen the ridge or lower its steepness.
+    """
+    dist, _ = path_distance(state, smooth_path(state, p.path))
+    half = length_to_blocks(state, p.width) / 2
+    core = CREST * half
+    t = np.clip(1.0 - np.maximum(dist - core, 0.0) / max(half - core, 1e-6), 0.0, 1.0)
+    profile = (t * t * (3.0 - 2.0 * t)) ** (sharpness(p.steepness) / RUGGED_SHARPNESS)
+
+    base = state.height.astype(np.float64)
+    spine = base + profile  # unit-height spine: the summit noise is weighted by height within it
+    mask = (profile > 0).astype(np.float64)
+    strength = detail_strength(spine, mask, "relief")
+    noise = detail_noise(state, MASSIF_SCALE * p.width, "ridged")
+    added = np.maximum(profile + MASSIF * p.roughness * noise * strength * mask, 0.0)
+    if added.max() > 0:
+        added *= p.height / added.max()
+    state.height = (base + added).astype(np.float32)
+    return state
