@@ -102,6 +102,14 @@ class CritiqueResult(BaseModel):
     verdict: Literal["pass", "revise"]
     failed: str | None = None  # why the critic model gave no usable critique this round (checks still ran)
     checklist: list[Item] = []  # spec checklist (DESIGN §11.3), computed by code; empty without a feature graph
+    fix_problems: list[list[str]] = []  # per issue: why its structured fix can't be applied as written (hint_problems)
+
+    def fix_stats(self) -> dict[str, int]:
+        """Structured-fix validity for reports: issues, those naming a tool, those valid as written, tool "none"."""
+        problems = self.fix_problems or [[] for _ in self.issues]
+        with_fix = [p for i, p in zip(self.issues, problems) if i.tool != "none"]
+        return {"issues": len(self.issues), "with_fix": len(with_fix), "valid": sum(not p for p in with_fix),
+                "none": len(self.issues) - len(with_fix)}
 
     @property
     def checklist_passes(self) -> int:
@@ -113,7 +121,7 @@ class CritiqueResult(BaseModel):
         return [i for i in self.checklist if i.status != "pass" and i.id in passed_before]
 
     def checklist_gains(self, previous: CritiqueResult) -> list[Item]:
-        """Checklist items that pass here but not in `previous` (shown when gate rule 2 keeps a revision)."""
+        """Checklist items that pass here but not in `previous` (named in the gate's why on a checklist gain)."""
         passed_before = {i.id for i in previous.checklist if i.status == "pass"}
         return [i for i in self.checklist if i.status == "pass" and i.id not in passed_before]
 
@@ -124,7 +132,7 @@ class CritiqueResult(BaseModel):
 
     @property
     def score(self) -> float:
-        """Mean rubric score; 0 when blocked. Used for score-gated acceptance."""
+        """Mean rubric score; 0 when blocked. For reports only: it never gates acceptance (DESIGN §11.4)."""
         if self.scores is None:
             return 0.0
         vals = [v for v in self.scores.model_dump().values() if v is not None]
@@ -144,7 +152,10 @@ class CritiqueResult(BaseModel):
             lines.append(checklist_summary(self.checklist))
         if self.issues:
             lines.append("Issues:")
-            lines += [f"- [{i.severity}] at {i.location}: {i.description} Fix: {i.fix_hint}{_fix_text(i)}" for i in self.issues]
+            problems = self.fix_problems or [[] for _ in self.issues]
+            lines += [f"- [{i.severity}] at {i.location}: {i.description} Fix: {i.fix_hint}"
+                      + (f" (fix not applicable as written: {'; '.join(p)})" if p else _fix_text(i))
+                      for i, p in zip(self.issues, problems)]
         return "\n".join(lines)
 
 
@@ -270,7 +281,8 @@ artifacts (rings or stripes of one block, bare stone walls, abrupt switches at o
 Fix materials with set_palette_rules or paint_region; a palette WARNING in the op list (a rule mostly \
 overridden by an earlier rule) is fixed by reordering the rules.
 - reference_match: how well the terrain matches the reference images, null if there are none. The photo is a \
-perspective view; the 3D render is from the south-west corner, so compare the main landforms, their \
+perspective view; with reference images the 3D render is taken from the south edge looking north, the \
+viewpoint the spec assumes for the photo (left = west, near = south), so compare the main landforms, their \
 arrangement (left/right, near/far), proportions, mood and palette, not exact geometry.
 
 3 means acceptable. Reserve 5 for results you would show as a showcase. Locate every issue with an op id \
@@ -427,7 +439,11 @@ class Critic:
         failed_major = any(not c.passed and c.severity == "major" for c in checks)
         failed_major |= any(i.status == "fail" and i.severity == "major" for i in items)
         verdict = "revise" if failed_major else out.verdict
-        return CritiqueResult(checks=checks, issues=out.issues, scores=out.scores, verdict=verdict, checklist=items), response
+        # Every fix is checked against the stack it was written for, so the builder never gets one that
+        # names a missing op, parameter or invalid value (DESIGN §11.5).
+        problems = [hint_problems(i, session.stack) for i in out.issues]
+        return CritiqueResult(checks=checks, issues=out.issues, scores=out.scores, verdict=verdict, checklist=items,
+                              fix_problems=problems), response
 
     def compare(
         self, spec: dict, first: AttemptView, second: AttemptView, references: list[bytes] | None = None

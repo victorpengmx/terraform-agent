@@ -6,12 +6,13 @@ Grown from a port of Thorsten Ball's "How to Build an Agent". Two layers:
   model ends its turn, the budget runs out or the model refuses. Branches on stop_reason explicitly.
 - `run_task`: the outer loop. BUILD -> CRITIQUE -> (REVISE | ACCEPT), up to `max_rounds`, with the
   acceptance gate of DESIGN §11.4: the first attempt is the baseline; a revision is rolled back if it
-  fails a blocking/major check the accepted attempt passed, or if a blind comparison prefers the accepted
-  attempt. Rolled-back rounds tell the builder why and what they had changed. Absolute rubric scores never
+  fails a blocking/major check the accepted attempt passed, passes fewer spec checklist items, or a blind
+  comparison prefers the accepted attempt. Rolled-back rounds tell the builder why and what they had changed. Absolute rubric scores never
   gate (they are noisy and tie often), and the run always ends on the latest accepted attempt.
 
-The SPEC step (DESIGN §9.3) comes in M5, CLARIFY and multi-stage runs (§9.1) later; for now the spec is
-the prompt and there is one stage.
+Before the loop, a SPEC step (DESIGN §9.3) turns the prompt and reference images into a feature graph, pinned
+for the run with the prompt (skipped with `use_spec=False`, or replaced by a given `graph`). CLARIFY and
+multi-stage runs (§9.1) come later; for now there is one stage.
 """
 
 from __future__ import annotations
@@ -67,6 +68,9 @@ class _Run:
     tracer: Tracer
     tracker: BudgetTracker
     step: int = 0
+    # This round's feedback, so an episode rotated mid-round keeps it (DESIGN §13).
+    critique: CritiqueResult | None = None
+    rollback: RollbackFeedback | None = None
 
 
 @dataclass
@@ -121,20 +125,24 @@ def run_task(
     for round_no in range(1, max_rounds + 1):
         result.rounds = round_no
         renders = render(session.state, f"{len(session.ops)} ops") if render and session.ops else []
-        feedback = accepted.critique if accepted else None
-        episode = context.build_episode(session, stage, critique=feedback, renders=renders, rollback=rollback)
+        run.critique, run.rollback = (accepted.critique if accepted else None), rollback
+        episode = context.build_episode(session, stage, critique=run.critique, renders=renders, rollback=rollback)
         outcome = run_stage(run, episode, stage, render)
         result.summary = outcome.summary or result.summary
         if outcome.stop != "done" or critic is None:
             result.stop = outcome.stop
             break
 
-        attempt = Attempt(round_no, session.snapshot(), _critique(run, critic, spec, stage, render, images))
-        result.critiques.append(attempt.critique)
-        if accepted is None:
-            keep, why = True, "first attempt (baseline)"
-        else:
-            keep, why = _gate(run, critic, spec, stage, render, images, accepted, attempt, compare_both_orders)
+        try:
+            attempt = Attempt(round_no, session.snapshot(), _critique(run, critic, spec, stage, render, images))
+            result.critiques.append(attempt.critique)
+            if accepted is None:
+                keep, why = True, "first attempt (baseline)"
+            else:
+                keep, why = _gate(run, critic, spec, stage, render, images, accepted, attempt, compare_both_orders)
+        except _OutOfBudget as e:  # an unjudged revision is never kept; round 1 ends on the built terrain
+            result.stop = f"budget: {e}"
+            break
 
         if keep:
             accepted, rollback = attempt, None
@@ -188,7 +196,8 @@ def run_stage(run: _Run, episode: Episode, stage: str, render: Renderer | None =
                 if run.context.should_rotate(episode, u.input_tokens + u.cache_read_tokens + u.cache_write_tokens):
                     # Results are already applied to the session; the new episode is built from it.
                     renders = render(run.session.state, f"{len(run.session.ops)} ops") if render else []
-                    fresh = run.context.build_episode(run.session, stage, renders=renders, continuing=True)
+                    fresh = run.context.build_episode(run.session, stage, critique=run.critique, renders=renders,
+                                                      rollback=run.rollback, continuing=True)
                     episode.messages[:] = fresh.messages  # a new conversation, not an edit of the old one
                     _trace(run, stage, note="episode rotated")
                 else:
@@ -233,9 +242,12 @@ def _spec(run: _Run, prompt: str, images: list[bytes]) -> FeatureGraph | None:
 def _critique(run: _Run, critic: Critic, spec: dict, stage: str, render: Renderer | None, references: list[bytes]) -> CritiqueResult:
     """Critique the current terrain. An unusable critic reply is retried once; a second failure records a
     failed round (programmatic checks only) instead of crashing the run."""
+    _check_budget(run, f"{stage}/critique", "critique")
     renders = render(run.session.state, f"{len(run.session.ops)} ops") if render else []
     error = ""
     for attempt in (1, 2):
+        if attempt == 2:
+            _check_budget(run, f"{stage}/critique", "critique retry")
         try:
             critique, response = critic.critique(spec, run.session, renders=renders, references=references)
         except CriticError as e:
@@ -246,32 +258,41 @@ def _critique(run: _Run, critic: Critic, spec: dict, stage: str, render: Rendere
             continue
         if response is not None:
             _charge(run, response)
-        _trace(run, f"{stage}/critique", response, scores=critique.model_dump(), note=f"score {critique.score:.2f}, {critique.verdict}")
+        _trace(run, f"{stage}/critique", response, scores=critique.model_dump() | {"fixes": critique.fix_stats()},
+               note=f"score {critique.score:.2f}, {critique.verdict}")
         return critique
     critique = CritiqueResult(checks=critic.run_checks(run.session), checklist=spec_checklist(spec, run.session),
                               verdict="revise", failed=error)
-    _trace(run, f"{stage}/critique", scores=critique.model_dump(), note="critic failed twice; round recorded with checks only")
+    _trace(run, f"{stage}/critique", scores=critique.model_dump() | {"fixes": critique.fix_stats()},
+           note="critic failed twice; round recorded with checks only")
     return critique
 
 
 def _gate(run: _Run, critic: Critic, spec: dict, stage: str, render: Renderer | None, references: list[bytes],
           accepted: Attempt, revision: Attempt, both_orders: bool) -> tuple[bool, str]:
-    """Acceptance gate (DESIGN §11.4): (keep the revision?, why)."""
+    """Acceptance gate (DESIGN §11.4): (keep the revision?, why).
+
+    1. A blocking/major check the accepted attempt passed now fails: roll back.
+    2. Fewer spec checklist passes: roll back. More passes still go to the comparison (a checklist gain can
+       come with a worse-looking build); the gained items are named in `why` either way.
+    3. Blind comparison: roll back only if it prefers the accepted attempt (in both orders with
+       `both_orders`); a tie or a failed comparison keeps the revision.
+    """
     regressed = revision.critique.regressions(accepted.critique)
     if regressed:  # rule 1
         return False, "it fails checks the accepted attempt passed: " + "; ".join(f"{c.name} ({c.detail})" for c in regressed)
-    # Rule 2, symmetric (decided 2026-10-23): the spec checklist is objective evidence, so fewer passes roll
-    # back and more passes keep the revision without asking the comparison; equal passes go on to rule 3.
     passes, before = revision.critique.checklist_passes, accepted.critique.checklist_passes
-    if accepted.critique.checklist and passes < before:
+    if accepted.critique.checklist and passes < before:  # rule 2
         lost = revision.critique.checklist_losses(accepted.critique)
         return False, (f"it passes {passes} spec checklist items, the accepted attempt {before}; no longer met: "
                        + "; ".join(f"{i.text} ({i.detail})" for i in lost))
+    gains = ""
     if accepted.critique.checklist and passes > before:
         gained = revision.critique.checklist_gains(accepted.critique)
-        return True, f"it passes {passes} spec checklist items, the accepted attempt {before}; newly met: " + "; ".join(i.text for i in gained)
+        gains = f" (it passes {passes} spec checklist items, the accepted attempt {before}; newly met: {'; '.join(i.text for i in gained)})"
 
     # Rule 3: blind comparison in a seeded random order; only a win for the accepted attempt rolls back.
+    _check_budget(run, f"{stage}/compare", "comparison")  # before rendering both attempts
     previous = AttemptView(render(accepted.checkpoint.state, None) if render else [], terrain_stats(accepted.checkpoint.state))
     current = AttemptView(render(revision.checkpoint.state, None) if render else [], terrain_stats(revision.checkpoint.state))
     revision_first = comparison_order(run.session.stack.base.seed, revision.round)
@@ -280,10 +301,10 @@ def _gate(run: _Run, critic: Critic, spec: dict, stage: str, render: Renderer | 
     winners = {w for w, _ in verdicts}
     why = verdicts[0][1]
     if winners == {"previous"}:
-        return False, f"a blind comparison preferred the accepted attempt: {why}"
+        return False, f"a blind comparison preferred the accepted attempt{' despite the checklist gain' if gains else ''}: {why}{gains}"
     if winners == {"revision"}:
-        return True, f"a blind comparison preferred it: {why}"
-    return True, f"no clear winner in the blind comparison, so the revision is kept: {why}"
+        return True, f"a blind comparison preferred it: {why}{gains}"
+    return True, f"no clear winner in the blind comparison, so the revision is kept: {why}{gains}"
 
 
 def comparison_order(seed: int, round_no: int) -> bool:
@@ -298,6 +319,7 @@ def _compare(run: _Run, critic: Critic, spec: dict, stage: str, references: list
     first, second = (current, previous) if revision_first else (previous, current)
     order = {"1": "revision", "2": "previous"} if revision_first else {"1": "previous", "2": "revision"}
     for attempt in (1, 2):
+        _check_budget(run, f"{stage}/compare", "comparison" if attempt == 1 else "comparison retry")
         try:
             out, response = critic.compare(spec, first, second, references)
         except CriticError as e:
@@ -311,6 +333,17 @@ def _compare(run: _Run, critic: Critic, spec: dict, stage: str, references: list
                note=f"blind comparison: {winner}")
         return winner, out.why
     return "same", "the comparison failed twice"
+
+
+class _OutOfBudget(Exception):
+    """The budget ran out before a critic or comparison call; `run_task` ends the run (message = reason)."""
+
+
+def _check_budget(run: _Run, stage: str, call: str) -> None:
+    """Every model call is budgeted, not only the builder's (DESIGN §9.2)."""
+    if (reason := run.tracker.exceeded()) is not None:
+        _trace(run, stage, note=f"{call} skipped: budget: {reason}")
+        raise _OutOfBudget(reason)
 
 
 def _charge(run: _Run, response: ModelResponse) -> None:

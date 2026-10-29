@@ -7,7 +7,7 @@ from agent.budget import Budget
 from agent.critic import Critic
 from agent.harness import comparison_order, run_task
 from agent.session import Session
-from agent.tools import observe_tools, op_tools
+from agent.tools import control_tools, observe_tools, op_tools
 from agent.tracing import Tracer
 from fakes import PEAK, ScriptedModel, compare_json, critique_json, response, text, tool_use
 
@@ -75,6 +75,27 @@ def test_step_budget_stops_a_looping_model(session, tmp_path):
     assert result.stop.startswith("budget: step budget") and len(session.ops) == 3
 
 
+def test_a_budget_spent_by_the_build_skips_the_critic_and_ends_cleanly(session, tmp_path):
+    builder = ScriptedModel(response(tool_use("raise_peak", PEAK), stop="tool_use"), response(text("built")))
+    critic_model = ScriptedModel()  # no responses: any critic call would fail the test
+    result = run(session, builder, tmp_path, critic=Critic(critic_model), budget=Budget(max_steps=2), max_rounds=3)
+    assert result.stop == "budget: step budget reached (2/2 model calls)" and critic_model.calls == []
+    assert result.critiques == [] and result.accepted_round is None and [e.id for e in session.ops] == ["raise_peak_1"]
+    notes = [json.loads(l)["note"] or "" for l in (tmp_path / "t.jsonl").read_text().splitlines()]
+    assert "critique skipped: budget: step budget reached (2/2 model calls)" in notes
+    assert notes[-1] == "run ended: budget: step budget reached (2/2 model calls)"
+
+
+def test_a_budget_spent_by_the_critique_skips_the_comparison_and_keeps_the_accepted_attempt(session, tmp_path):
+    # Steps: build 2 + critique 1 + build 2 + critique 1 = 6, so the comparison must not run.
+    critic_model = ScriptedModel(critique_json(3), critique_json(4))
+    result = run(session, two_rounds(("raise_peak", HILL_2)), tmp_path, critic=Critic(critic_model),
+                 budget=Budget(max_steps=6), max_rounds=3)
+    assert result.stop.startswith("budget: step budget") and len(critic_model.calls) == 2 and len(result.critiques) == 2
+    assert result.accepted_round == 1 and [e.id for e in session.ops] == ["raise_peak_1"]  # the unjudged revision is undone
+    assert "comparison skipped: budget" in (tmp_path / "t.jsonl").read_text()
+
+
 def test_episode_rotates_when_context_is_long(session, tmp_path):
     model = ScriptedModel(
         response(tool_use("raise_peak", PEAK), stop="tool_use", input_tokens=200_000),
@@ -83,6 +104,27 @@ def test_episode_rotates_when_context_is_long(session, tmp_path):
     run(session, model, tmp_path)
     fresh = model.calls[1]["messages"]
     assert len(fresh) == 1 and "continues earlier work" in fresh[0]["content"][-1]["text"]
+
+
+def test_a_rotated_episode_keeps_the_rounds_critique_and_rollback_feedback(session, tmp_path):
+    # Round 1 accepted, round 2 rolled back by the comparison; round 3's first reply overflows the context.
+    builder = ScriptedModel(
+        response(tool_use("raise_peak", PEAK), stop="tool_use"), response(text("r1")),
+        response(tool_use("raise_peak", HILL_2, id="tu_2"), stop="tool_use"), response(text("r2")),
+        response(tool_use("update_op", {"id": "raise_peak_1", "params": {"height": 14}}, id="tu_3"), stop="tool_use",
+                 input_tokens=200_000),
+        response(text("r3")),
+    )
+    critic_model = ScriptedModel(critique_json(3), critique_json(3), compare_json(previous_wins(0, 2), "the peak got worse"),
+                                 critique_json(3), compare_json("same"))
+    tools = {t.name: t for t in [*op_tools(session), *control_tools(session)]}
+    run_task(prompt="a hill", images=[], session=session, tools=tools, model=builder, critic=Critic(critic_model),
+             tracer=Tracer(run_id="t", root=tmp_path), budget=Budget(), max_rounds=3, use_spec=False)
+    rotated = builder.calls[5]["messages"]
+    opening = rotated[0]["content"][-1]["text"]
+    assert len(rotated) == 1 and "continues earlier work" in opening
+    assert "# Critique of the current terrain" in opening and "too round" in opening
+    assert "Round 2 was not kept" in opening and "the peak got worse" in opening
 
 
 # ---------------------------------------------------------------- acceptance gate (DESIGN §11.4)
