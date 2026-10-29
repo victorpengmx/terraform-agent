@@ -1,6 +1,6 @@
 """A/B for the critic's tool catalogue (DESIGN §11.5): same terrains, same renders, prompt with and without it.
 
-    python -m scripts.catalogue_ab [--model claude-haiku-5-5] [--limit N]
+    python -m scripts.experiments.catalogue_ab [--model claude-haiku-5-5] [--limit N]
 
 Re-critiques every saved final op stack (renders/<run_id>/stack.json, prompt from traces/<run_id>.jsonl) once
 per arm and checks each structured fix with `hint_problems`: does it name a real tool, real parameters and
@@ -18,7 +18,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from agent.critic import Critic, CriticError, hint_problems
+from agent.catalogue import hint_problems
+from agent.critic import Critic, CriticError
 from agent.session import Session
 from agent.tracing import Tracer, TraceRecord
 from terrain.opstack import OpStack

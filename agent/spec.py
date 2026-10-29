@@ -13,10 +13,11 @@ import json
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
 
-from agent.models import ModelAdapter, ModelResponse
+from agent.models import ModelAdapter, ModelReplyError, ModelResponse, structured_call
+from agent.prompts import SPEC_SYSTEM
 from agent.tools import image_block, text_block
+from terrain.schema import Strict
 
 FeatureType = Literal["peak", "mountain_range", "hills", "ridge", "valley", "canyon", "river", "lake", "sea", "plateau",
                       "mesa", "basin", "island", "other"]
@@ -26,11 +27,7 @@ ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 MAX_FEATURES = 15
 
 
-class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid")  # additionalProperties: false, required by structured outputs
-
-
-class Position(_Strict):
+class Position(Strict):
     """Text form (x, y) or image form (image_x, depth); the other pair is null."""
 
     x: Literal["left", "center", "right", "any"] | None
@@ -39,7 +36,7 @@ class Position(_Strict):
     depth: Literal["near", "middle", "far"] | None
 
 
-class SpecFeature(_Strict):
+class SpecFeature(Strict):
     id: str
     type: FeatureType
     position: Position
@@ -52,13 +49,13 @@ class SpecFeature(_Strict):
     notes: str
 
 
-class Relation(_Strict):
+class Relation(Strict):
     subject: str
     relation: RelationKind
     object: str  # a feature id, or north_edge / south_edge / west_edge / east_edge
 
 
-class FeatureGraph(_Strict):
+class FeatureGraph(Strict):
     features: list[SpecFeature]
     relations: list[Relation]
     materials: str
@@ -147,45 +144,9 @@ def graph_text(graph: FeatureGraph) -> str:
 
 # ---------------------------------------------------------------- SPEC step
 
-SPEC_SYSTEM = """\
-You turn a request for a Minecraft landscape into a feature graph that a builder and a checker will use. \
-You do not build anything.
 
-The area is seen from its south edge, looking north: x left = west, right = east; y back = north (far), \
-front = south (near).
-
-- features: the 3 to 15 landforms the request names or clearly implies (peaks, ranges, hills, ridges, \
-valleys, canyons, rivers, lakes, sea, plateaus, mesas, basins, islands). One feature per distinct landform; \
-for a range with named peaks use the range plus peaks with part_of. ids: lowercase letters, digits and _, \
-e.g. river_1.
-- position: for a text request set x and y and leave image_x and depth null. Use any unless the request \
-says or clearly implies where the feature's centre is: "a river flowing to the south edge" says where it \
-ends, not where its centre is, so its y is any. For a reference image set image_x and depth as seen in the \
-image and leave x and y null.
-- slope: only if the request implies it: gentle (<15 deg), moderate (15-35), steep (35-60), cliff (>60); \
-else null. For plateaus, mesas, canyons, valleys and basins it means their walls. winding, for rivers, \
-valleys and canyons: almost straight, winding, twisty, meandering; else null.
-- span_x, span_y: how far the feature reaches west-east and north-south: narrow (under a third of the area), \
-wide (a third to two thirds), full (more than two thirds). Only when the request or image shows it ("a range \
-across the whole horizon", "ridges running from the back to the front"); else null. For an image, judge \
-span_x against the frame width at the feature's depth and span_y from far to near.
-- tallest: true for at most one feature, only if the request implies which is tallest.
-- relations: only those the request states or that follow directly from its wording ("a river flowing \
-from the mountains" is flows_from; a river and a lake in the same request is not a relation): left_of, right_of, behind, in_front_of, taller_than, \
-lower_than between features; flows_from (a river from a feature); reaches (a river to a feature or to \
-north_edge, south_edge, west_edge, east_edge).
-- materials: the surface look in one sentence. unsupported: things asked for that terrain tools cannot \
-make (buildings, trees, mist, animals, weather).
-- notes: a few words of character or mood per feature, or empty.
-Do not invent detail the request does not ask for: unspecified means null or any."""
-
-
-class SpecError(Exception):
+class SpecError(ModelReplyError):
     """The SPEC reply was unusable (refusal, truncation, invalid JSON or an invalid graph)."""
-
-    def __init__(self, message: str, response: ModelResponse | None = None) -> None:
-        super().__init__(message)
-        self.response = response
 
 
 def write_spec(model: ModelAdapter, prompt: str, images: list[bytes] | None = None) -> tuple[FeatureGraph, ModelResponse]:
@@ -195,14 +156,7 @@ def write_spec(model: ModelAdapter, prompt: str, images: list[bytes] | None = No
     if images:
         request += "\n\nReference image(s) are attached above: describe the landforms in them, with image positions."
     content.append(text_block(request))
-    response = model.complete([{"role": "user", "content": content}], system=SPEC_SYSTEM,
-                              response_schema=FeatureGraph.model_json_schema())
-    if response.stop_reason != "end_turn":
-        raise SpecError(f"stopped with {response.stop_reason!r} (details: {response.stop_details})", response)
-    try:
-        graph = FeatureGraph.model_validate_json(response.text)
-    except ValidationError as e:
-        raise SpecError(f"returned invalid JSON: {e}", response) from None
+    graph, response = structured_call(model, content, SPEC_SYSTEM, FeatureGraph, SpecError)
     if problems := graph.problems():
         raise SpecError("invalid graph: " + "; ".join(problems), response)
     return graph, response

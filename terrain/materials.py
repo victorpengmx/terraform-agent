@@ -16,9 +16,11 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from scipy.ndimage import distance_transform_edt, gaussian_filter
+from pydantic import ConfigDict, Field, field_validator, model_validator
+from scipy.ndimage import distance_transform_edt
 
+from terrain.geometry import slope_deg
+from terrain.schema import Strict
 from terrain.noise import fractal_noise
 from terrain.state import WorldState
 
@@ -62,11 +64,11 @@ SOIL_UNDER = {"grass_block": "dirt", "podzol": "dirt", "mycelium": "dirt", "moss
               "rooted_dirt": "dirt", "sand": "sandstone", "red_sand": "red_sandstone", "snow_block": "stone"}  # fmt: skip
 
 
-class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+class _Frozen(Strict):
+    model_config = ConfigDict(frozen=True)  # rules are immutable values; extra="forbid" comes from Strict
 
 
-class Condition(_Strict):
+class Condition(_Frozen):
     """All given limits must hold. Omit a field to ignore it."""
 
     slope_min: float | None = Field(default=None, ge=0, le=90, description="Degrees.")
@@ -81,12 +83,12 @@ class Condition(_Strict):
         "partly this rule and partly the next (a 30° slope can be grass in one place and rock in another).")
 
 
-class Single(_Strict):
+class Single(_Frozen):
     kind: Literal["single"] = "single"
     block: BlockName
 
 
-class Mix(_Strict):
+class Mix(_Frozen):
     kind: Literal["mix"] = "mix"
     blocks: dict[BlockName, float] = Field(description="Block -> relative weight, e.g. {\"grass_block\": 0.8, \"podzol\": 0.2}.")
     patch_size: float = Field(default=0.03, gt=0, le=0.5, description="Patch size as a fraction of the shorter side.")
@@ -99,7 +101,7 @@ class Mix(_Strict):
         return v
 
 
-class Banded(_Strict):
+class Banded(_Frozen):
     kind: Literal["banded"] = "banded"
     blocks: list[BlockName] = Field(min_length=1, max_length=12, description="Blocks cycled as horizontal strata.")
     band_min: int = Field(default=2, ge=1, le=16, description="Thinnest band, blocks.")
@@ -116,7 +118,7 @@ class Banded(_Strict):
 Use = Annotated[Single | Mix | Banded, Field(discriminator="kind")]
 
 
-class Rule(_Strict):
+class Rule(_Frozen):
     when: Condition = Field(default_factory=Condition)
     use: Use
     subsurface: BlockName | None = Field(default=None, description="Block under the surface; default depends on the surface block.")
@@ -144,8 +146,7 @@ def surface_metrics(state: WorldState) -> tuple[np.ndarray, np.ndarray]:
 
     Slope is taken over a lightly smoothed surface: material should follow the landform, not single-block
     steps, or rock rules speckle grassland wherever detail noise left a 1-block jump."""
-    gz, gx = np.gradient(gaussian_filter(state.height.astype(np.float64), SLOPE_SMOOTHING))
-    slope = np.degrees(np.arctan(np.hypot(gx, gz)))
+    slope = slope_deg(state.height.astype(np.float64), SLOPE_SMOOTHING)
     wet = ~np.isnan(state.water)
     dist = distance_transform_edt(~wet) if wet.any() else np.full(state.height.shape, np.inf)
     return slope, dist
