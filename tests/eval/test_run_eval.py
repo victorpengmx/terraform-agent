@@ -110,14 +110,38 @@ def test_finished_runs_are_skipped_and_errors_retried(tmp_path):
 def test_the_cost_gate_spends_nothing_without_yes(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(run_eval, "RESULTS", tmp_path)
     monkeypatch.setattr(run_eval, "evaluate", lambda *a, **k: pytest.fail("evaluate ran without --yes"))
-    monkeypatch.setattr(sys, "argv", ["run_eval", "--config", "eval/configs/e1_critic.yaml"])
+    monkeypatch.setattr(sys, "argv", ["run_eval", "--config", "eval/configs/pilot_haiku.yaml"])
     with pytest.raises(SystemExit, match="--yes"):
         run_eval.main()
     out = capsys.readouterr().out
-    assert "60 pending runs; estimated cost up to $37.71" in out
-    assert "critic_on: 30 runs x $1.00 cap = $30.00" in out and "critic_off: 30 runs x $0.25 cap = $7.50" in out
-    monkeypatch.setattr(sys, "argv", ["run_eval", "--config", "eval/configs/e1_critic.yaml", "--dry-run", "--yes"])
+    assert "4 pending runs; estimated cost up to $2.51" in out
+    assert "critic_on: 2 runs x $1.00 cap = $2.00" in out and "critic_off: 2 runs x $0.25 cap = $0.50" in out
+    monkeypatch.setattr(sys, "argv", ["run_eval", "--config", "eval/configs/pilot_haiku.yaml", "--dry-run", "--yes"])
     run_eval.main()  # a dry run never spends, even with --yes
+
+
+def test_a_role_without_a_price_makes_its_condition_unknown_never_zero():
+    unpriced = "gemini-3.6-flash"  # in PRICES without numbers
+    cfg = config(prompts="all", seeds=[1, 2], conditions={"critic_on": {"critic": True}, "critic_off": {"critic": False,
+                 "budget": {"max_cost_usd": 0.25}}}, models={"builder": "claude-haiku-5-5", "critic": unpriced,
+                                                            "judge": "claude-opus-5-5"})
+    text, upper = run_eval.estimate(cfg, run_eval.plan(cfg, ENTRIES))
+    assert upper is None and "$0.00" not in text
+    assert f"critic_on: 30 runs x $1.00 cap = unknown (no price for critic {unpriced}, comparison {unpriced}" in text
+    assert "critic_off: 30 runs x $0.25 cap = $7.50" in text  # Haiku builder only: priced
+    assert "estimated cost up to unknown (priced part up to $" in text
+    cfg = config(models={"builder": "claude-opus-5-5", "critic": "claude-opus-5-5", "judge": unpriced})
+    text, upper = run_eval.estimate(cfg, run_eval.plan(cfg, ENTRIES))
+    assert upper is None and f"judge: 2 calls on {unpriced} = unknown (no price for judge {unpriced})" in text
+
+
+def test_the_eval_configs_are_fully_priced():
+    from eval.config import load_config
+
+    for name in ("pilot_haiku", "pilot", "e1_critic", "e2_spec", "opus", "regression"):
+        cfg = load_config(f"eval/configs/{name}.yaml")
+        text, upper = run_eval.estimate(cfg, run_eval.plan(cfg, ENTRIES))
+        assert upper is not None and "unknown" not in text, (name, text)
 
 
 def test_pairs_share_prompt_and_seed_across_conditions():

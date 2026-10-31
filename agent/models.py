@@ -28,13 +28,36 @@ PRICES: dict[str, dict[str, float | None]] = {
     # TODO(victor): fill in from https://ai.google.dev/gemini-api/docs/pricing (Standard tier).
     # gemini-3.1-pro-preview is priced in two tiers by prompt length; this table holds one rate.
     "gemini-4-argon": {"input": None, "output": None, "cache_read": None},
-    "gemini-3.8-flash": {"input": None, "output": None, "cache_read": None},
+    # Paid tier, from the pricing page (2026-10-31). gemini-3.8-flash (the M6 eval critic): these rates hold through
+    # 2026-12-31; from 2027-01-01 they double (1.50 / 7.50 / 0.15): update before runs in 2027. Explicit-cache
+    # storage ($0.50 / $1.00 per 1M tokens per hour) is not billed here: we only use implicit caching.
+    "gemini-3.8-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
+    "gemini-3.5-flash-lite": {"input": 0.30, "output": 2.50, "cache_read": 0.03},
     "gemini-3.6-flash": {"input": None, "output": None, "cache_read": None},
     "gemini-3.1-pro-preview": {"input": None, "output": None, "cache_read": None},
-    # Standard tier, from https://ai.google.dev/gemini-api/docs/pricing (2026-10-31); the M6 eval judge.
+    # Standard tier, from https://ai.google.dev/gemini-api/docs/pricing (2026-10-31).
     "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50, "cache_read": 0.025},
 }
 CACHE_WRITE_MULTIPLIER = 1.25  # 5-minute TTL cache writes
+
+
+@dataclass(frozen=True)
+class PriceTier:
+    """A long-prompt tier: a request whose prompt (input + cache read + cache write) exceeds `threshold` tokens
+    is billed at `rates` on every line item (cache writes at the tier's input rate x CACHE_WRITE_MULTIPLIER)."""
+
+    threshold: int
+    rates: dict[str, float | None]
+
+
+PRICE_TIERS: dict[str, PriceTier] = {
+    # Haiku 5.5 above 100K prompt tokens: 5x on input, output, cache read and cache write.
+    # TODO(victor): confirm against the Anthropic price list.
+    "claude-haiku-5-5": PriceTier(100_000, {"input": 0.50, "output": 2.50, "cache_read": 0.05}),
+}
+
+ROTATION_TOKENS = 150_000  # default episode-rotation threshold (prompt tokens of the last call, DESIGN §13)
+TIER_ROTATION_MARGIN = 10_000  # with a long-prompt tier: rotate this far below its threshold
 
 # Models that accept the server-side refusal fallback (`fallbacks="default"`).
 FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5"}
@@ -71,11 +94,17 @@ class Usage:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
 
+    @property
+    def prompt_tokens(self) -> int:
+        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+
     def cost_usd(self, model: str) -> float | None:
-        """None when the model or one of its prices is unknown (reported as "unknown", never as $0)."""
+        """Cost of ONE request (a long-prompt tier depends on that request's prompt size, so never call this on
+        summed usage). None when the model or one of its prices is unknown (reported as "unknown", never $0)."""
         if not price_known(model):
             return None
-        p = PRICES[model]
+        tier = PRICE_TIERS.get(model)
+        p = tier.rates if tier is not None and self.prompt_tokens > tier.threshold else PRICES[model]
         return (
             self.input_tokens * p["input"]
             + self.output_tokens * p["output"]
@@ -86,7 +115,16 @@ class Usage:
 
 def price_known(model: str) -> bool:
     p = PRICES.get(model)
-    return p is not None and all(v is not None for v in p.values())
+    tier = PRICE_TIERS.get(model)
+    return (p is not None and all(v is not None for v in p.values())
+            and (tier is None or all(v is not None for v in tier.rates.values())))
+
+
+def rotation_threshold(model: str) -> int:
+    """Prompt tokens at which a builder episode rotates: below a long-prompt tier when the model has one, so a
+    long episode doesn't tip every later call into the higher rates."""
+    tier = PRICE_TIERS.get(model)
+    return tier.threshold - TIER_ROTATION_MARGIN if tier is not None else ROTATION_TOKENS
 
 
 @dataclass
@@ -121,9 +159,12 @@ class ModelAdapter(Protocol):
         system: str | list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
         response_schema: dict[str, Any] | None = None,
+        cache_messages: bool = True,
     ) -> ModelResponse:
         """One model call. `response_schema` constrains the reply to JSON matching that schema
-        (no numeric/string-length constraints; every object needs additionalProperties: false)."""
+        (no numeric/string-length constraints; every object needs additionalProperties: false).
+        `cache_messages=False`: cache only the system prompt, for one-shot calls whose messages are never
+        sent again (writing them to the cache would cost 1.25x for nothing)."""
         ...
 
 
@@ -139,11 +180,12 @@ _T = TypeVar("_T", bound=BaseModel)
 
 
 def structured_call(model: ModelAdapter, content: list[dict[str, Any]], system: str, schema: type[_T],
-                    error: type[ModelReplyError] = ModelReplyError) -> tuple[_T, ModelResponse]:
+                    error: type[ModelReplyError] = ModelReplyError, cache_messages: bool = True) -> tuple[_T, ModelResponse]:
     """One strict-JSON call in a fresh context (one user message). Raises `error` (a ModelReplyError
-    subclass, so callers keep their own except clauses), carrying the response so its cost is still charged."""
+    subclass, so callers keep their own except clauses), carrying the response so its cost is still charged.
+    `cache_messages`: see `ModelAdapter.complete`."""
     response = model.complete([{"role": "user", "content": content}], system=system,
-                              response_schema=schema.model_json_schema())
+                              response_schema=schema.model_json_schema(), cache_messages=cache_messages)
     if response.stop_reason != "end_turn":
         raise error(f"stopped with {response.stop_reason!r} (details: {response.stop_details})", response)
     try:
@@ -161,14 +203,11 @@ class AnthropicAdapter:
         if self.client is None:
             self.client = anthropic.Anthropic()  # credentials from ANTHROPIC_API_KEY or `ant auth login`
 
-    def complete(self, messages, *, system=None, tools=None, response_schema=None) -> ModelResponse:
+    def complete(self, messages, *, system=None, tools=None, response_schema=None, cache_messages=True) -> ModelResponse:
         cfg = self.config
-        kwargs: dict[str, Any] = {
-            "model": cfg.model,
-            "max_tokens": cfg.max_tokens,
-            "messages": messages,
-            "cache_control": {"type": "ephemeral"},  # auto-cache the longest stable prefix
-        }
+        kwargs: dict[str, Any] = {"model": cfg.model, "max_tokens": cfg.max_tokens, "messages": messages}
+        if cache_messages:
+            kwargs["cache_control"] = {"type": "ephemeral"}  # auto-cache the longest stable prefix
         if system is not None:
             # Separate breakpoint at the end of tools + system: every new episode and every critic call
             # shares this prefix, but the automatic breakpoint (end of messages) never matches across episodes.

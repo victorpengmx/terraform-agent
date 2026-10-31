@@ -147,6 +147,36 @@ def test_usage_cost():
     assert Usage(1).cost_usd("unknown-model") is None
 
 
+def test_a_long_prompt_tier_prices_every_line_item_of_that_request():
+    # Haiku 5.5 base: input 0.10, output 0.50, cache read 0.01, cache write 0.10 x 1.25 per 1M.
+    at_threshold = Usage(input_tokens=40_000, output_tokens=2_000, cache_read_tokens=50_000, cache_write_tokens=10_000)
+    assert at_threshold.prompt_tokens == 100_000  # not above it: base rates
+    assert at_threshold.cost_usd("claude-haiku-5-5") == pytest.approx((40_000 * 0.10 + 2_000 * 0.50 + 50_000 * 0.01
+                                                                       + 10_000 * 0.125) / 1e6)
+    # One token more and the whole request, output included, is billed at 5x.
+    over = Usage(input_tokens=40_001, output_tokens=2_000, cache_read_tokens=50_000, cache_write_tokens=10_000)
+    assert over.cost_usd("claude-haiku-5-5") == pytest.approx((40_001 * 0.50 + 2_000 * 2.50 + 50_000 * 0.05
+                                                               + 10_000 * 0.625) / 1e6)
+    base = (40_001 * 0.10 + 2_000 * 0.50 + 50_000 * 0.01 + 10_000 * 0.125) / 1e6
+    assert over.cost_usd("claude-haiku-5-5") == pytest.approx(5 * base)
+    # Models without a tier keep one rate set at any size.
+    assert Usage(500_000).cost_usd("claude-opus-5-5") == pytest.approx(2.0)
+
+
+def test_a_tier_with_a_missing_rate_makes_the_price_unknown(monkeypatch):
+    from agent import models
+
+    monkeypatch.setitem(models.PRICE_TIERS, "claude-haiku-5-5", models.PriceTier(100_000, {"input": None, "output": 2.5, "cache_read": 0.05}))
+    assert not models.price_known("claude-haiku-5-5") and Usage(10).cost_usd("claude-haiku-5-5") is None
+
+
+def test_rotation_threshold_is_model_aware():
+    from agent.models import rotation_threshold
+
+    assert rotation_threshold("claude-haiku-5-5") == 90_000  # 10K below its 100K tier
+    assert rotation_threshold("claude-opus-5-5") == rotation_threshold("gemini-3.8-flash") == 150_000
+
+
 def test_budget_trips_on_steps_and_cost():
     t = BudgetTracker(Budget(max_steps=2, max_cost_usd=1.0))
     t.charge(Usage(10, 10), 0.4)
@@ -227,3 +257,59 @@ def test_render_view_refuses_unchanged_repeats_and_caps_views(session, viewer):
     execute(tools, tool_use("smooth", {"strength": 0.5}))
     capped = view(tools)
     assert capped["is_error"] is True and "view limit reached (3 per run)" in capped["content"]
+
+
+def test_one_shot_calls_can_cache_only_the_system_prompt():
+    client, calls = fake_client()
+    adapter = AnthropicAdapter(ModelConfig(model="claude-haiku-5-5"), client=client)
+    adapter.complete([{"role": "user", "content": "x"}], system="sys")
+    adapter.complete([{"role": "user", "content": "x"}], system="sys", cache_messages=False)
+    assert calls[0]["cache_control"] == {"type": "ephemeral"}  # builder episodes: the automatic breakpoint too
+    assert "cache_control" not in calls[1]
+    assert calls[1]["system"] == [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]
+
+
+def critic_client(*bodies):
+    """An Anthropic client stand-in replying with `bodies` in turn; usage reports cache reads and writes."""
+    calls, replies = [], list(bodies)
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=json.dumps(replies.pop(0)))], stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=900, output_tokens=300, cache_read_input_tokens=6000, cache_creation_input_tokens=0),
+            model=kwargs["model"], _request_id="req_c")
+
+    messages = SimpleNamespace(create=create)
+    return SimpleNamespace(messages=messages, beta=SimpleNamespace(messages=messages)), calls
+
+
+def test_critique_and_comparison_cache_only_the_system_prompt_and_trace_cache_tokens(tmp_path):
+    from agent.budget import Budget
+    from agent.critic import Critic
+    from agent.harness import run_task
+    from agent.session import Session
+    from agent.tools import op_tools
+    from agent.tracing import Tracer
+    from fakes import PEAK, ScriptedModel, compare_json, critique_json, response, text, tool_use
+
+    critique = json.loads(critique_json(3).content[0].text)
+    compare = json.loads(compare_json("same").content[0].text)
+    client, calls = critic_client(critique, critique, compare)
+    critic = Critic(AnthropicAdapter(ModelConfig(model="claude-haiku-5-5", effort="low"), client=client))
+    session = Session.flat(33, 33, base_y=64)
+    builder = ScriptedModel(response(tool_use("raise_peak", PEAK), stop="tool_use"), response(text("r1")),
+                            response(tool_use("raise_peak", PEAK | {"center": [0.3, 0.3], "height": 10}, id="tu_2"), stop="tool_use"),
+                            response(text("r2")))
+    run_task(prompt="a hill", images=[], session=session, tools={t.name: t for t in op_tools(session)}, model=builder,
+             critic=critic, tracer=Tracer(run_id="t", root=tmp_path), budget=Budget(), max_rounds=2, use_spec=False)
+    assert len(calls) == 3  # two critiques, one comparison
+    for c in calls:
+        assert "cache_control" not in c  # no write for the per-call renders and text
+        assert c["system"][-1]["cache_control"] == {"type": "ephemeral"}  # the stable system prompt is cached
+    assert calls[0]["system"] == calls[1]["system"]  # byte-identical, so the second critique reads it
+    records = [json.loads(l) for l in (tmp_path / "t.jsonl").read_text(encoding="utf-8").splitlines()]
+    judged = [r for r in records if r["stage"].endswith(("/critique", "/compare")) and r.get("usage")]
+    assert len(judged) == 3
+    assert all(r["usage"] == {"input": 900, "output": 300, "cache_read": 6000, "cache_write": 0} for r in judged)
+    assert all(r["cost_usd"] == pytest.approx((900 * 0.10 + 300 * 0.50 + 6000 * 0.01) / 1e6) for r in judged)
