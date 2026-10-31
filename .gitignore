@@ -22,3 +22,7 @@ textures/
 
 # Local Claude Code settings
 .claude/
+
+# Eval run outputs (traces, stacks, renders) and the judge cache; configs and baselines are committed
+eval/results/
+eval/cache/
