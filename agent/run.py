@@ -51,7 +51,7 @@ def main() -> None:
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--image", type=Path, action="append", default=[], help="reference image (repeatable)")
     ap.add_argument("--model", default=ModelConfig.model, help="builder (and SPEC) model id: claude-... or gemini-...")
-    ap.add_argument("--effort", default=ModelConfig.effort, choices=EFFORTS)
+    ap.add_argument("--effort", default=None, choices=EFFORTS, help="default: each provider's default effort")
     ap.add_argument("--critic-model", default=None, help="critic (and comparison) model id (default: same as --model)")
     ap.add_argument("--no-critic", action="store_true", help="single pass, no critique rounds")
     ap.add_argument("--rounds", type=int, default=3, help="max build/critique rounds")
@@ -88,6 +88,7 @@ class RunConfig:
     effort: str | None = ModelConfig.effort
     critic: bool = True
     critic_model: str | None = None  # critic and comparison; None = the builder's model
+    critic_max_tokens: int | None = None  # critic and comparison output limit, thinking included; None = ModelConfig's
     rounds: int = 3
     size: tuple[int, int] = (256, 256)
     base_y: float = 64.0
@@ -106,7 +107,9 @@ def execute(cfg: RunConfig, tracer: Tracer, out_dir: Path,
     observe = [] if cfg.render == "none" else observe_tools(session, out_dir)
     tools = {t.name: t for t in [*op_tools(session), *control_tools(session), *observe]}
     model = make_model(ModelConfig(model=cfg.model, effort=cfg.effort))
-    critic = Critic(make_model(ModelConfig(model=cfg.critic_model or cfg.model, effort=cfg.effort))) if cfg.critic else None
+    critic_limit = {"max_tokens": cfg.critic_max_tokens} if cfg.critic_max_tokens else {}
+    critic = (Critic(make_model(ModelConfig(model=cfg.critic_model or cfg.model, effort=cfg.effort, **critic_limit)))
+              if cfg.critic else None)
     for m in sorted({model.config.model, *([] if critic is None else [critic.model.config.model])}):
         if not price_known(m):
             print(f"WARNING: no price for {m} in agent/models.py PRICES: costs are reported as unknown and the "
@@ -157,6 +160,7 @@ def run_header(cfg: RunConfig, images: list[bytes], session: Session, budget: Bu
         "references": [{"path": Path(p).as_posix(), "sha256": hashlib.sha256(b).hexdigest()} for p, b in zip(cfg.images, images)],
         "builder_model": cfg.model,
         "critic_model": (cfg.critic_model or cfg.model) if cfg.critic else None,
+        "critic_max_tokens": cfg.critic_max_tokens if cfg.critic else None,
         "models": role_models(cfg),
         "effort": cfg.effort,
         "max_rounds": cfg.rounds,

@@ -76,9 +76,11 @@ def test_text_reply_usage_and_request_config():
     config = client.calls[0]["config"]
     assert config.system_instruction == "sys" and config.max_output_tokens == 16000
     assert config.automatic_function_calling.disable is True
-    assert config.thinking_config.thinking_level == genai_types.ThinkingLevel.HIGH
-    assert config.thinking_config.include_thoughts is None and config.tools is None
+    assert config.thinking_config is None and config.tools is None  # no effort stated: the model's default thinking
     assert [c.role for c in client.calls[0]["contents"]] == ["user"]
+    model, client = adapter(reply({"text": "hi"}), effort="high")
+    model.complete([{"role": "user", "content": "x"}])
+    assert client.calls[0]["config"].thinking_config.thinking_level == genai_types.ThinkingLevel.HIGH
 
 
 def test_tool_round_trip_through_the_harness(tmp_path):
@@ -325,3 +327,14 @@ def test_requests_run_on_a_worker_thread_so_ctrl_c_gets_through():
     client.models.generate_content = lambda **kw: threads.append(threading.current_thread().name) or inner(**kw)
     assert model.complete([{"role": "user", "content": "x"}]).text == "hi"
     assert threads == ["gemini-request"]
+
+
+def test_the_timeout_grows_with_the_output_limit():
+    from agent.gemini import request_timeout
+
+    assert request_timeout(ModelConfig(model=MODEL)) == 180.0  # 16K at 100 tokens/s = 160 s: the floor holds
+    assert request_timeout(ModelConfig(model=MODEL, max_tokens=32_000)) == 320.0
+    model, client = adapter(reply({"text": "hi"}), max_tokens=32_000)
+    model.complete([{"role": "user", "content": "x"}])
+    assert client.calls[0]["config"].http_options.timeout == 320_000  # ms
+    assert GeminiAdapter(ModelConfig(model=MODEL), client=FakeClient(), timeout_s=5.0).timeout_s == 5.0

@@ -2,8 +2,8 @@
 
     python -m eval.report eval/results/e1_critic eval/results/e2_spec --name m6 [--calibration NAME]
 
-- E1 critic_on vs critic_off and E2 critic_on vs spec_off: success rate and mean answer-key pass rate per
-  condition (all, text, image); paired win/loss/tie per (prompt, seed); exact sign test; bootstrap 95% CI of
+- E1 critic_on vs critic_off and E2 critic_on vs spec_off: success rate, mean answer-key pass rate and mean judge
+  score per condition (all, text, image), each also as a paired metric; paired win/loss/tie per (prompt, seed); exact sign test; bootstrap 95% CI of
   the paired difference (prompts resampled); a per-prompt table. "No clear difference at this N" whenever the
   CI includes 0.
 - E4 per condition: cost and tokens per successful build, p50/p95 latency, steps, tool-error rate, critic
@@ -56,8 +56,17 @@ def judge_paid(r: dict[str, Any]) -> float | None:
     return j.get("paid_usd", j.get("cost_usd"))
 
 
+def judge_mean(r: dict[str, Any]) -> float | None:
+    """The judge's mean score (1-5): a continuous measure of looks, next to the pass/fail in success."""
+    return (r.get("judge") or {}).get("mean")
+
+
 def pass_rate(r: dict[str, Any]) -> float | None:
     return (r.get("answer_key") or {}).get("pass_rate")
+
+
+METRICS = {"success": overall, "pass_rate": pass_rate, "judge_mean": judge_mean}  # paired metrics, in report order
+METRIC_LABELS = {"success": "success", "pass_rate": "pass rate", "judge_mean": "judge mean (1-5)"}
 
 
 def pairs(rows: list[dict[str, Any]], a: str, b: str, kind: str | None = None) -> list[tuple[dict, dict]]:
@@ -74,7 +83,7 @@ def pairs(rows: list[dict[str, Any]], a: str, b: str, kind: str | None = None) -
 
 def compare(ps: list[tuple[dict, dict]], metric: str) -> dict[str, Any]:
     """Paired comparison of a minus b on `success` (pairs with an unknown side dropped) or `pass_rate`."""
-    get = overall if metric == "success" else pass_rate
+    get = METRICS[metric]
     wins = losses = ties = unknown = 0
     diffs: dict[str, list[float]] = defaultdict(list)
     for ra, rb in ps:
@@ -96,7 +105,9 @@ def condition_summary(rows: list[dict[str, Any]], cond: str, kind: str | None) -
     rs = done(rows, cond, kind)
     known = [overall(r) for r in rs if overall(r) is not None]
     rates = [pass_rate(r) for r in rs if pass_rate(r) is not None]
+    scores = [judge_mean(r) for r in rs if judge_mean(r) is not None]
     return {"n": len(rs), "success": mean(known) if known else None, "unknown": len(rs) - len(known),
+            "judge_mean": mean(scores) if scores else None,
             "pass_rate": mean(rates) if rates else None}
 
 
@@ -175,17 +186,19 @@ def experiment_section(rows: list[dict[str, Any]], code: str, title: str, a: str
     for kind in KINDS:
         for cond in (a, b):
             s = condition_summary(rs, cond, kind)
-            body.append([kind or "all", f"`{cond}`", str(s["n"]), pct(s["success"]), str(s["unknown"]), pct(s["pass_rate"])])
-    out += table(["prompts", "condition", "runs", "success", "judge unknown", "mean checklist pass rate"], body) + [""]
+            body.append([kind or "all", f"`{cond}`", str(s["n"]), pct(s["success"]), str(s["unknown"]), pct(s["pass_rate"]),
+                         num(s["judge_mean"])])
+    out += table(["prompts", "condition", "runs", "success", "judge unknown", "mean checklist pass rate",
+                  "mean judge score (1-5)"], body) + [""]
     body = []
     for kind in KINDS:
         ps = pairs(rs, a, b, kind)
-        for metric in ("success", "pass_rate"):
+        for metric in METRICS:
             c = compare(ps, metric)
             verdict = (stats.label(c["ci"], a, b) if c["prompts"] >= MIN_PROMPTS
                        else f"too few prompts to tell ({c['prompts']})")
-            body.append([kind or "all", metric.replace("_", " "), f"{c['wins']} / {c['losses']} / {c['ties']}",
-                         str(c["unknown"]), num(c["p"], "{:.3f}"), ci_text(c["ci"], True), verdict])
+            body.append([kind or "all", METRIC_LABELS[metric], f"{c['wins']} / {c['losses']} / {c['ties']}",
+                         str(c["unknown"]), num(c["p"], "{:.3f}"), ci_text(c["ci"], metric != "judge_mean"), verdict])
     out += [f"Paired by (prompt, seed): `{a}` minus `{b}`. Wins/losses/ties count pairs where `{a}` is better/worse/equal; "
             "p is the exact two-sided sign test (ties dropped); the CI resamples prompts (10 000 bootstrap samples). "
             f"No verdict below {MIN_PROMPTS} prompts.", ""]
@@ -199,9 +212,11 @@ def experiment_section(rows: list[dict[str, Any]], code: str, title: str, a: str
             mine = {r["seed"]: r for r in done(rs, cond) if r["prompt_id"] == pid}
             marks = "".join({True: "✓", False: "✗", None: "?"}[overall(mine[s])] if s in mine else "·" for s in seeds)
             rates = [pass_rate(r) for r in mine.values() if pass_rate(r) is not None]
-            cells += [marks, pct(mean(rates)) if rates else "n/a"]
+            scores = [judge_mean(r) for r in mine.values() if judge_mean(r) is not None]
+            cells += [marks, pct(mean(rates)) if rates else "n/a", num(mean(scores)) if scores else "n/a"]
         body.append(cells)
-    out += table(["prompt", "kind", f"`{a}` success", f"`{a}` pass rate", f"`{b}` success", f"`{b}` pass rate"], body) + [""]
+    out += table(["prompt", "kind", *(h for c in (a, b) for h in (f"`{c}` success", f"`{c}` pass rate", f"`{c}` judge"))],
+                 body) + [""]
     return out
 
 
@@ -212,8 +227,8 @@ def e4_section(rows: list[dict[str, Any]]) -> list[str]:
         ("runs / successes", lambda e: f"{e['n']} / {e['successes']}"),
         ("agent cost (builder, SPEC, critic)", lambda e: money(e["cost"])),
         ("judge cost", lambda e: money(e["judge_cost"])),
-        ("cost per successful build", lambda e: money(e["cost_per_success"])),
-        ("tokens per successful build", lambda e: num(e["tokens_per_success"], "{:,.0f}")),
+        ("cost per successful build", lambda e: "n/a (0 successes)" if not e["successes"] else money(e["cost_per_success"])),
+        ("tokens per successful build", lambda e: "n/a (0 successes)" if not e["successes"] else num(e["tokens_per_success"], "{:,.0f}")),
         ("latency p50 / p95 (s)", lambda e: f"{num(e['p50_latency'], '{:.0f}')} / {num(e['p95_latency'], '{:.0f}')}"),
         ("model calls per run", lambda e: num(e["steps"], "{:.1f}")),
         ("tool-error rate", lambda e: pct(e["tool_error_rate"])),
@@ -226,8 +241,10 @@ def e4_section(rows: list[dict[str, Any]]) -> list[str]:
     ]
     out = ["## E4: Cost and efficiency", ""]
     out += table(["metric", *(f"`{c}`" for c in conds)], [[m, *(f(effs[c]) for c in conds)] for m, f in metrics])
+    workers = sorted({r.get("workers", 1) for r in done(rows)})
     out += ["", "Tokens include cache reads and writes. Cost per successful build divides all of a condition's agent cost "
-            "by its successes. The revision win rate should stay clearly below 100% and Terrain 1 near 50% (DESIGN §11.4).", ""]
+            "by its successes. The revision win rate should stay clearly below 100% and Terrain 1 near 50% (DESIGN §11.4). "
+            f"Latency is wall time per run with {' or '.join(map(str, workers))} run(s) at a time.", ""]
     return out
 
 
@@ -269,7 +286,8 @@ def limitations(rows: list[dict[str, Any]], calibrated: bool) -> list[str]:
     if shared["critic"]:
         out.append(f"- The judge shares the critic's model family in {shared['critic']} runs: it may share the taste the "
                    "critic optimized for, which favours critic_on in E1.")
-    out.append("- The judge is human-calibrated (E3 below)." if calibrated else
+    out.append(("- The judge was checked against one person's ratings (E3 above); its pass/fail is part of success, "
+                "so read the success rates with E3's agreement in mind.") if calibrated else
                "- The judge is not yet calibrated against human ratings (E3 pending); its pass/fail is part of success.")
     if judge_unknown:
         out.append(f"- {judge_unknown} runs have no usable judge verdict; their success is unknown and left out of the success rates.")
